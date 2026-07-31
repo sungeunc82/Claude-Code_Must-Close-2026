@@ -679,6 +679,7 @@ tbody tr:hover{background:var(--panel-2);}
 
 
 
+
 <script>
 // ================================================================
 // LIVE DATA PIPELINE — reads the 5 source tabs directly from the
@@ -1450,6 +1451,7 @@ async function discoverSheetsConnector() {
 function extractDocText(payload) {
   if (typeof payload === "string") return payload;
   if (payload && typeof payload === "object") {
+    if (typeof payload.fileContent === "string") return payload.fileContent;
     if (typeof payload.text === "string") return payload.text;
     if (typeof payload.content === "string") return payload.content;
     if (Array.isArray(payload.content)) {
@@ -1502,27 +1504,92 @@ function parseCsvText(text) {
   return rows.filter(r => !(r.length === 1 && r[0].trim() === ""));
 }
 
-// Splits read_file_content's whole-document text into { "<Sheet Name>": rawCsvText }
-// by locating each "# <Sheet Name>" markdown heading and the fenced code block under it.
-function parseWholeDocIntoTabs(docText) {
-  const sections = {};
-  const chunks = docText.split(/\n(?=#\s)/);
-  chunks.forEach(chunk => {
-    const headerMatch = chunk.match(/^#\s+(.+?)\s*\n/);
-    if (!headerMatch) return;
-    const name = headerMatch[1].trim();
-    const rest = chunk.slice(headerMatch[0].length);
-    const fenceMatch = rest.match(/```[^\n]*\n([\s\S]*?)\n\s*```/);
-    if (fenceMatch) sections[name] = fenceMatch[1];
+// read_file_content renders sheets as GFM-style pipe tables (observed live), sometimes
+// with a blank header row + separator ahead of the real header (an artifact of a blank
+// row 1 in the source sheet) -- both get skipped as non-data rows here.
+function unescapeMarkdown(s) {
+  return s.replace(/\\([_*#\\`~\[\]()>])/g, "$1");
+}
+function looksLikePipeTable(text) {
+  return /\|\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?/.test(text);
+}
+function parsePipeTableText(text) {
+  const PIPE_PLACEHOLDER = "@@PIPE@@";
+  const protectedText = text.replace(/\\\|/g, PIPE_PLACEHOLDER);
+  const rows = [];
+  protectedText.split(/\r?\n/).forEach(line => {
+    if (!line.includes("|")) return;
+    let cells = line.split("|").map(c => unescapeMarkdown(c.split(PIPE_PLACEHOLDER).join("|")).trim());
+    if (cells.length && cells[0] === "") cells = cells.slice(1);
+    if (cells.length && cells[cells.length - 1] === "") cells = cells.slice(0, -1);
+    if (!cells.length) return;
+    const isSeparatorRow = cells.every(c => c === "" || /^:?-+:?$/.test(c));
+    const isBlankRow = cells.every(c => c === "");
+    if (isSeparatorRow || isBlankRow) return;
+    rows.push(cells);
   });
-  return sections;
+  return rows;
+}
+// Auto-detects pipe-table vs. comma-CSV per section, since the two source formats
+// observed for this connector/tool differ from each other.
+function parseTabContent(text) {
+  return looksLikePipeTable(text) ? parsePipeTableText(text) : parseCsvText(text);
 }
 
-function findTabSection(sections, wantedName) {
-  if (sections[wantedName] !== undefined) return sections[wantedName];
-  const wantedNorm = wantedName.trim().toLowerCase();
-  const key = Object.keys(sections).find(k => k.trim().toLowerCase() === wantedNorm);
-  return key !== undefined ? sections[key] : undefined;
+// ---- Section splitting ----
+// Locates each of the 5 needed tabs inside the whole-document text. Tries a markdown
+// heading first ("#".."######" followed by the tab name), since that's the more common
+// convention; falls back to finding the tab name's own literal (or markdown-underscore-
+// escaped) text anywhere in the document and treating everything from the end of that
+// line up to the next marker (another located tab, or any heading at all) as its content.
+// This is deliberately format-agnostic: this connector's rendering was observed to omit
+// heading markers entirely for at least the first sheet in the document.
+function findAllHeadings(docText) {
+  const headings = [];
+  const re = /^#{1,6}\s+(.+?)\s*$/gm;
+  let m;
+  while ((m = re.exec(docText))) headings.push({ name: m[1].trim(), index: m.index, contentStart: re.lastIndex + 1 });
+  return headings;
+}
+function locateByPosition(docText, name) {
+  const escapedVariant = name.replace(/_/g, "\\_");
+  const idxPlain = docText.lastIndexOf(name);
+  const idxEscaped = escapedVariant !== name ? docText.lastIndexOf(escapedVariant) : -1;
+  const idx = Math.max(idxPlain, idxEscaped);
+  if (idx === -1) return null;
+  const lineEnd = docText.indexOf("\n", idx);
+  return { idx, contentStart: lineEnd === -1 ? docText.length : lineEnd + 1 };
+}
+function locateTabSections(docText, wantedNames) {
+  const headings = findAllHeadings(docText);
+  const headingIndices = headings.map(h => h.index);
+  const notFound = [];
+
+  // One unified, sorted marker list regardless of how each wanted tab was located,
+  // so a heading-found tab's content still stops at a later positional-found tab
+  // (and vice versa) rather than only ever stopping at another heading.
+  const markers = [];
+  wantedNames.forEach(name => {
+    const heading = headings.find(h => h.name.toLowerCase() === name.trim().toLowerCase());
+    if (heading) {
+      markers.push({ name, idx: heading.index, contentStart: heading.contentStart });
+      return;
+    }
+    const pos = locateByPosition(docText, name);
+    if (pos) markers.push({ name, idx: pos.idx, contentStart: pos.contentStart });
+    else notFound.push(name);
+  });
+
+  markers.sort((a, b) => a.idx - b.idx);
+  const sections = {};
+  markers.forEach((marker, i) => {
+    const nextMarkerIdx = i + 1 < markers.length ? markers[i + 1].idx : Infinity;
+    const nextHeadingIdx = headingIndices.find(hIdx => hIdx > marker.contentStart);
+    const end = Math.min(nextMarkerIdx, nextHeadingIdx !== undefined ? nextHeadingIdx : Infinity, docText.length);
+    sections[marker.name] = docText.slice(marker.contentStart, end === Infinity ? docText.length : end);
+  });
+
+  return { sections, notFound, headingsFoundCount: headings.length };
 }
 
 async function loadLiveData() {
@@ -1565,28 +1632,53 @@ async function loadLiveData() {
     e.code = "unrecognized_payload";
     throw e;
   }
-  const sections = parseWholeDocIntoTabs(docText);
   const tabEntries = Object.entries(SHEET_TABS);
-  const missing = tabEntries.filter(([, tabName]) => findTabSection(sections, tabName) === undefined);
-  if (missing.length) {
+  const wantedNames = tabEntries.map(([, tabName]) => tabName);
+  const { sections, notFound, headingsFoundCount } = locateTabSections(docText, wantedNames);
+  if (notFound.length) {
     const err = new Error(
-      `${missing.length}/${tabEntries.length} expected tab(s) not found in the document read back from ${conn.server} / ${conn.tool}: ` +
-      missing.map(([, t]) => `"${t}"`).join(", ")
+      `${notFound.length}/${tabEntries.length} expected tab(s) could not be located anywhere in the document read back from ${conn.server} / ${conn.tool}: ` +
+      notFound.map(t => `"${t}"`).join(", ")
     );
     err.code = "tab_not_found";
     err.server = conn.server;
     err.tool = conn.tool;
-    err.missingTabs = missing.map(([, t]) => t);
+    err.missingTabs = notFound;
     err.sectionsFound = Object.keys(sections);
+    err.headingsFoundCount = headingsFoundCount;
     err.docTextLength = docText.length;
+    err.docTextPreview = docText.slice(0, 1500);
     throw err;
   }
 
-  const mcRaw = parseCsvText(findTabSection(sections, SHEET_TABS.mustClose));
-  const oppRaw = parseCsvText(findTabSection(sections, SHEET_TABS.opportunities));
-  const caseRaw = parseCsvText(findTabSection(sections, SHEET_TABS.cases));
-  const rlRaw = parseCsvText(findTabSection(sections, SHEET_TABS.revenue));
-  const nsRaw = parseCsvText(findTabSection(sections, SHEET_TABS.nextSteps));
+  const parsed = {};
+  tabEntries.forEach(([key, tabName]) => { parsed[key] = parseTabContent(sections[tabName]); });
+
+  // A section that parsed to <2 rows (no header + data) almost certainly means the
+  // positional slice grabbed the wrong span -- fail loudly with the raw section text
+  // rather than silently feeding buildDashboardData near-empty tables.
+  const thin = tabEntries.filter(([key]) => parsed[key].length < 2);
+  if (thin.length) {
+    const err = new Error(
+      `${thin.length}/${tabEntries.length} tab(s) parsed to fewer than 2 rows, suggesting the section boundary is wrong: ` +
+      thin.map(([, t]) => `"${t}"`).join(", ")
+    );
+    err.code = "thin_section";
+    err.server = conn.server;
+    err.tool = conn.tool;
+    err.thinTabs = thin.map(([key, t]) => ({ tab: t, rowCount: parsed[key].length }));
+    err.sectionPreviews = thin.reduce((acc, [, t]) => {
+      acc[t] = (sections[t] || "").slice(0, 800);
+      return acc;
+    }, {});
+    throw err;
+  }
+
+  const mcRaw = parsed.mustClose;
+  const oppRaw = parsed.opportunities;
+  const caseRaw = parsed.cases;
+  const rlRaw = parsed.revenue;
+  const nsRaw = parsed.nextSteps;
 
   const mcRows = rowsToObjects(mcRaw);
   const oppRows = rowsToObjects(oppRaw);
@@ -2854,8 +2946,12 @@ function describeError(err){
   if(err && err.allTools && err.allTools.length) parts.push('other tools on that server: ' + err.allTools.filter(t=>t!==err.tool).join(', '));
   if(err && err.code) parts.push('error code: ' + err.code);
   if(err && err.missingTabs) parts.push('missing tab(s): ' + err.missingTabs.join(', '));
-  if(err && err.sectionsFound) parts.push('sections actually found in the document: ' + (err.sectionsFound.join(', ') || '(none)'));
+  if(err && err.sectionsFound) parts.push('sections resolved: ' + (err.sectionsFound.join(', ') || '(none)'));
+  if(err && err.headingsFoundCount !== undefined) parts.push('markdown headings found in doc: ' + err.headingsFoundCount);
   if(err && err.docTextLength !== undefined) parts.push('document text length: ' + err.docTextLength + ' chars');
+  if(err && err.docTextPreview !== undefined) parts.push('document start preview: ' + err.docTextPreview);
+  if(err && err.thinTabs) parts.push('thin tab(s): ' + err.thinTabs.map(t=>`${t.tab} (${t.rowCount} row(s))`).join(', '));
+  if(err && err.sectionPreviews) parts.push('section preview(s): ' + JSON.stringify(err.sectionPreviews));
   if(err && err.payloadType !== undefined) parts.push('payload type: ' + err.payloadType);
   if(err && err.payloadKeys !== undefined) parts.push('payload keys: ' + JSON.stringify(err.payloadKeys));
   if(err && err.payloadPreview !== undefined) parts.push('payload preview: ' + err.payloadPreview);

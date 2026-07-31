@@ -743,16 +743,16 @@ async function discoverSheetsConnector() {
   const result = await window.claude.mcp.listTools();
   const servers = (result && result.servers) || [];
   const nameMatch = s => SHEETS_SERVER_CANDIDATES.some(c => c.toLowerCase() === s.toLowerCase());
-  // Prefer a server whose display name matches a candidate AND has a plausible
-  // "read a sheet/spreadsheet" tool.
+  // Confirmed live: "Google Drive" exposes read_file_content, which returns the WHOLE
+  // spreadsheet as one natural-language/markdown document (all tabs, no per-tab range
+  // reads available on this connector) -- see parseWholeDocIntoTabs below.
   for (const server of servers) {
     if (!nameMatch(server.server)) continue;
     if (!server.tools || !server.tools.length) continue; // not connected / no tools granted
-    const tool = server.tools.find(t => /sheet|spreadsheet/i.test(t.name) && /read|get|export|value|content/i.test(t.name))
-              || server.tools.find(t => /read_file_content|download_file_content|export/i.test(t.name));
+    const tool = server.tools.find(t => /^read_file_content$/i.test(t.name))
+              || server.tools.find(t => /read_file_content|download_file_content/i.test(t.name));
     if (tool) return { server: server.server, tool: tool.name, allTools: server.tools.map(t => t.name) };
   }
-  // Fall back to any connected server exposing a generic file-content reader.
   for (const server of servers) {
     if (!server.tools || !server.tools.length) continue;
     const tool = server.tools.find(t => /read_file_content|download_file_content/i.test(t.name));
@@ -761,55 +761,70 @@ async function discoverSheetsConnector() {
   return { availableServers: servers.map(s => ({ server: s.server, tools: (s.tools || []).map(t => t.name) })) };
 }
 
-// Permissively parse whatever shape the connector tool hands back into a 2D array of rows
-// (header row first), since the exact payload shape for this connector is unverified.
-function coercePayloadToRows(payload) {
-  if (payload == null) return [];
-  if (Array.isArray(payload)) {
-    if (payload.length && Array.isArray(payload[0])) return payload; // already 2D
-    if (payload.length && typeof payload[0] === "object") {
-      // array of row objects -- rebuild a header row from the union of keys
-      const header = Array.from(payload.reduce((set, row) => { Object.keys(row).forEach(k => set.add(k)); return set; }, new Set()));
-      return [header, ...payload.map(row => header.map(h => row[h]))];
+// read_file_content's payload has been observed as a plain string (the natural-language
+// doc). Handle a couple of plausible wrapper shapes defensively too.
+function extractDocText(payload) {
+  if (typeof payload === "string") return payload;
+  if (payload && typeof payload === "object") {
+    if (typeof payload.text === "string") return payload.text;
+    if (typeof payload.content === "string") return payload.content;
+    if (Array.isArray(payload.content)) {
+      const textBlock = payload.content.find(b => b && b.type === "text" && typeof b.text === "string");
+      if (textBlock) return textBlock.text;
     }
-    return [payload]; // array of scalars -- treat as a single row
   }
-  if (typeof payload === "object") {
-    // common wrapper shapes
-    if (Array.isArray(payload.values)) return payload.values;
-    if (Array.isArray(payload.rows)) return payload.rows;
-    if (Array.isArray(payload.data)) return coercePayloadToRows(payload.data);
-  }
-  if (typeof payload === "string") {
-    // last resort: parse as CSV/TSV text
-    const delim = payload.includes("\t") ? "\t" : ",";
-    return payload.split(/\r?\n/).filter(l => l.length).map(l => l.split(delim));
-  }
-  throw new Error("Unrecognized payload shape from the Sheets connector tool -- cannot parse into rows.");
+  throw new Error("read_file_content returned a payload shape with no recognizable text content.");
 }
 
-// One attempt shape per call -- if the connector's real tool expects a different
-// parameter name, this throws and the caller attaches full context (server, tool,
-// args sent, underlying message/result) so the on-page error banner can show exactly
-// what to fix, rather than a bare "upstream_error".
-async function fetchSheetTab(conn, tabName) {
-  const range = `'${tabName}'!A1:ZZ20000`;
-  const args = { spreadsheetId: SPREADSHEET_ID, fileId: SPREADSHEET_ID, range, sheetName: tabName };
-  try {
-    const result = await window.claude.mcp.callTool(conn.server, conn.tool, args, { cache: { refresh: true } });
-    return coercePayloadToRows(result.payload);
-  } catch (e) {
-    const err = new Error(`Reading tab "${tabName}" via ${conn.server} / ${conn.tool} failed: ${(e && e.message) || e}`);
-    err.code = (e && e.code) || "unknown";
-    err.server = (e && e.server) || conn.server;
-    err.tool = conn.tool;
-    err.tab = tabName;
-    err.attemptedArgs = args;
-    err.originalMessage = e && e.message;
-    err.retryable = e && e.retryable;
-    err.result = e && e.result;
-    throw err;
+// A real CSV parser (quoted fields, "" escaping, embedded commas/newlines inside quotes) --
+// the exported rows include quoted HTML anchor tags with commas inside href attributes,
+// so naive split(',') / split('\n') would corrupt rows.
+function parseCsvText(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; } else { inQuotes = false; }
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = "";
+    } else if (c === '\r') {
+      // skip -- \n (or end of quoted field) handles the row break
+    } else if (c === '\n') {
+      row.push(field); field = ""; rows.push(row); row = [];
+    } else {
+      field += c;
+    }
   }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => !(r.length === 1 && r[0].trim() === ""));
+}
+
+// Splits read_file_content's whole-document text into { "<Sheet Name>": rawCsvText }
+// by locating each "# <Sheet Name>" markdown heading and the fenced code block under it.
+function parseWholeDocIntoTabs(docText) {
+  const sections = {};
+  const chunks = docText.split(/\n(?=#\s)/);
+  chunks.forEach(chunk => {
+    const headerMatch = chunk.match(/^#\s+(.+?)\s*\n/);
+    if (!headerMatch) return;
+    const name = headerMatch[1].trim();
+    const rest = chunk.slice(headerMatch[0].length);
+    const fenceMatch = rest.match(/```[^\n]*\n([\s\S]*?)\n\s*```/);
+    if (fenceMatch) sections[name] = fenceMatch[1];
+  });
+  return sections;
+}
+
+function findTabSection(sections, wantedName) {
+  if (sections[wantedName] !== undefined) return sections[wantedName];
+  const wantedNorm = wantedName.trim().toLowerCase();
+  const key = Object.keys(sections).find(k => k.trim().toLowerCase() === wantedNorm);
+  return key !== undefined ? sections[key] : undefined;
 }
 
 async function loadLiveData() {
@@ -825,29 +840,48 @@ async function loadLiveData() {
     err.availableServers = conn.availableServers;
     throw err;
   }
-  const tabEntries = Object.entries(SHEET_TABS);
-  const settled = await Promise.allSettled(tabEntries.map(([, tabName]) => fetchSheetTab(conn, tabName)));
-  const failed = settled
-    .map((s, i) => ({ s, tab: tabEntries[i][1] }))
-    .filter(x => x.s.status === "rejected");
-  if (failed.length) {
-    const first = failed[0].s.reason;
-    const err = new Error(
-      `Failed to read ${failed.length}/${tabEntries.length} tab(s) via ${conn.server} / ${conn.tool}. ` +
-      `First failure (tab "${failed[0].tab}"): ${(first && first.message) || first}`
-    );
-    err.code = (first && first.code) || "upstream_error";
-    err.server = conn.server;
+
+  const args = { fileId: SPREADSHEET_ID };
+  let result;
+  try {
+    result = await window.claude.mcp.callTool(conn.server, conn.tool, args, { cache: { refresh: true } });
+  } catch (e) {
+    const err = new Error(`Reading the spreadsheet via ${conn.server} / ${conn.tool} failed: ${(e && e.message) || e}`);
+    err.code = (e && e.code) || "unknown";
+    err.server = (e && e.server) || conn.server;
     err.tool = conn.tool;
     err.allTools = conn.allTools;
-    err.failedTabs = failed.map(f => f.tab);
-    err.attemptedArgs = first && first.attemptedArgs;
-    err.originalMessage = first && first.originalMessage;
-    err.retryable = first && first.retryable;
-    err.result = first && first.result;
+    err.attemptedArgs = args;
+    err.originalMessage = e && e.message;
+    err.retryable = e && e.retryable;
+    err.result = e && e.result;
     throw err;
   }
-  const [mcRaw, oppRaw, caseRaw, rlRaw, nsRaw] = settled.map(s => s.value);
+
+  const docText = extractDocText(result.payload);
+  const sections = parseWholeDocIntoTabs(docText);
+  const tabEntries = Object.entries(SHEET_TABS);
+  const missing = tabEntries.filter(([, tabName]) => findTabSection(sections, tabName) === undefined);
+  if (missing.length) {
+    const err = new Error(
+      `${missing.length}/${tabEntries.length} expected tab(s) not found in the document read back from ${conn.server} / ${conn.tool}: ` +
+      missing.map(([, t]) => `"${t}"`).join(", ")
+    );
+    err.code = "tab_not_found";
+    err.server = conn.server;
+    err.tool = conn.tool;
+    err.missingTabs = missing.map(([, t]) => t);
+    err.sectionsFound = Object.keys(sections);
+    err.docTextLength = docText.length;
+    throw err;
+  }
+
+  const mcRaw = parseCsvText(findTabSection(sections, SHEET_TABS.mustClose));
+  const oppRaw = parseCsvText(findTabSection(sections, SHEET_TABS.opportunities));
+  const caseRaw = parseCsvText(findTabSection(sections, SHEET_TABS.cases));
+  const rlRaw = parseCsvText(findTabSection(sections, SHEET_TABS.revenue));
+  const nsRaw = parseCsvText(findTabSection(sections, SHEET_TABS.nextSteps));
+
   const mcRows = rowsToObjects(mcRaw);
   const oppRows = rowsToObjects(oppRaw);
   const caseRows = rowsToObjects(caseRaw);

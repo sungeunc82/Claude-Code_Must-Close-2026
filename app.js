@@ -1033,6 +1033,24 @@ function renderConcentration(){
 }
 function renderRevenue(){
   const grid = document.getElementById('rev-kpi-grid');
+  let revBanner = document.getElementById('revenue-data-unavailable-banner');
+  if(S.revenue_data_unavailable){
+    if(!revBanner){
+      revBanner = document.createElement('div');
+      revBanner.id = 'revenue-data-unavailable-banner';
+      revBanner.className = 'card';
+      revBanner.style.borderColor = 'var(--warm)';
+      grid.parentNode.insertBefore(revBanner, grid);
+    }
+    revBanner.style.display = 'block';
+    revBanner.innerHTML = `
+      <div class="card-head"><div>
+        <div class="card-title" style="color:var(--warm);">⚠ Revenue Data unavailable this refresh</div>
+        <div class="card-sub">The Revenue Data tab couldn't be read this time (${escapeHtml(S.revenue_data_unavailable_reason||'unknown reason')}) — existing-client actuals below read as $0 until it's available again. This tab updates monthly (around the 20th) and isn't Salesforce-sourced like the others, so this shouldn't affect must-close pipeline tracking day to day.</div>
+      </div></div>`;
+  } else if(revBanner){
+    revBanner.style.display = 'none';
+  }
   grid.innerHTML = `
     <div class="kpi accent"><div class="label">Total open Y1 pipeline</div><div class="value">${fmtMoney(S.total_y1_pipeline)}</div><div class="foot">Across ${S.with_opportunity} assignments with an open opp</div></div>
     <div class="kpi accent"><div class="label">2026 Realizable pipeline</div><div class="value">${fmtMoney(S.realizable_2026_pipeline)}</div><div class="foot">Probability × ramp/pro-ration to 12/31/2026 — see formula below</div></div>

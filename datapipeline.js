@@ -277,7 +277,7 @@ const CALENDAR_FINDINGS = {
 const STABLECOIN_COLLISION_SET = new Set(["Ripple"]);
 
 // ---------------- Main merge/scoring pipeline ----------------
-function buildDashboardData(mcRows, oppRows, caseRows, rlRows, nsRows) {
+function buildDashboardData(mcRows, oppRows, caseRows, rlRows, nsRows, revenueUnavailableReason) {
   const oppsByAccount = {};
   oppRows.forEach(o => {
     const k = norm(o["Account Name"]);
@@ -549,14 +549,14 @@ function buildDashboardData(mcRows, oppRows, caseRows, rlRows, nsRows) {
     });
   });
 
-  return aggregateDashboardData(records, assignedOwnerColPresent);
+  return aggregateDashboardData(records, assignedOwnerColPresent, revenueUnavailableReason || null);
 }
 
 function round2(v) { return Math.round(v * 100) / 100; }
 function fmtDate(d) { return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`; }
 
 // ---------------- Aggregation (mirrors aggregate.py: rep/motion/product/gm rollup + concentration + ramp signal) ----------------
-function aggregateDashboardData(records, assignedOwnerColPresent) {
+function aggregateDashboardData(records, assignedOwnerColPresent, revenueUnavailableReason) {
   const LIKELIHOODS = ["Onboarding - Active", "Onboarding - Stalled", "Contract Negotiation - Active", "Contract Negotiation - Stalled", "Hot", "Warm", "Cold", "Stalled", "No Opportunity"];
 
   // ---- Rep rollup: existing metrics + ramp signal + New Logo/Expansion revenue split ----
@@ -711,6 +711,11 @@ function aggregateDashboardData(records, assignedOwnerColPresent) {
     hot: byLik("Hot"), warm: byLik("Warm"), cold: byLik("Cold"), stalled: byLik("Stalled"), no_opp_bucket: byLik("No Opportunity"),
     reps_total: reps.length, reps_below_touch_bar: reps.filter(x => x.zero_touch > 0).length,
     assigned_owner_col_present: assignedOwnerColPresent,
+    // Revenue Data updates monthly (~20th) and isn't Salesforce-sourced like the other
+    // tabs -- when this connector can't render it, degrade gracefully instead of
+    // blocking the whole dashboard (see loadLiveData's revenueUnavailableReason).
+    revenue_data_unavailable: !!revenueUnavailableReason,
+    revenue_data_unavailable_reason: revenueUnavailableReason || "",
   };
 
   return { summary, reps, motions, products, gm, concentration, accounts: records };
@@ -999,15 +1004,27 @@ async function loadLiveData() {
   const tabEntries = Object.entries(SHEET_TABS);
   const wantedNames = tabEntries.map(([, tabName]) => tabName);
   const { sections, notFound, headingsFoundCount, methods } = locateTabSections(docText, wantedNames);
-  if (notFound.length) {
+
+  // Revenue Data is optional: it's not one of the Salesforce-sourced auto-refresh tabs,
+  // and read_file_content has been observed to omit it from the document entirely (its
+  // name shows up once, in what looks like a sheet-name index, with no content section
+  // anywhere) -- almost certainly because it's the wide, multi-row-header sheet this
+  // natural-language export can't render. Rather than block the whole dashboard on a tab
+  // this connector tool can't produce, degrade gracefully and flag it in the UI instead.
+  const OPTIONAL_KEYS = new Set(["revenue"]);
+  const requiredEntries = tabEntries.filter(([key]) => !OPTIONAL_KEYS.has(key));
+  const optionalEntries = tabEntries.filter(([key]) => OPTIONAL_KEYS.has(key));
+
+  const requiredNotFound = requiredEntries.filter(([, t]) => notFound.includes(t)).map(([, t]) => t);
+  if (requiredNotFound.length) {
     const err = new Error(
-      `${notFound.length}/${tabEntries.length} expected tab(s) could not be located anywhere in the document read back from ${conn.server} / ${conn.tool}: ` +
-      notFound.map(t => `"${t}"`).join(", ")
+      `${requiredNotFound.length}/${requiredEntries.length} required tab(s) could not be located anywhere in the document read back from ${conn.server} / ${conn.tool}: ` +
+      requiredNotFound.map(t => `"${t}"`).join(", ")
     );
     err.code = "tab_not_found";
     err.server = conn.server;
     err.tool = conn.tool;
-    err.missingTabs = notFound;
+    err.missingTabs = requiredNotFound;
     err.sectionsFound = Object.keys(sections);
     err.locationMethods = methods;
     err.headingsFoundCount = headingsFoundCount;
@@ -1015,17 +1032,27 @@ async function loadLiveData() {
     err.docTextPreview = docText.slice(0, 1500);
     throw err;
   }
+  let revenueUnavailableReason = null;
+  if (optionalEntries.some(([, t]) => notFound.includes(t))) {
+    revenueUnavailableReason = "not found in the document";
+  }
 
   const parsed = {};
-  tabEntries.forEach(([key, tabName]) => { parsed[key] = parseTabContent(sections[tabName]); });
+  tabEntries.forEach(([key, tabName]) => {
+    parsed[key] = notFound.includes(tabName) ? [] : parseTabContent(sections[tabName]);
+  });
 
   // A section that parsed to <2 rows (no header + data) almost certainly means the
   // positional slice grabbed the wrong span -- fail loudly with the raw section text
-  // rather than silently feeding buildDashboardData near-empty tables.
-  const thin = tabEntries.filter(([key]) => parsed[key].length < 2);
-  if (thin.length) {
+  // rather than silently feeding buildDashboardData near-empty tables. Only required
+  // tabs block the load; a thin optional tab (Revenue Data) just degrades gracefully.
+  const thinRequired = requiredEntries.filter(([key]) => parsed[key].length < 2);
+  const thinOptional = optionalEntries.filter(([key]) => parsed[key].length < 2);
+  if (thinOptional.length) revenueUnavailableReason = revenueUnavailableReason || "parsed to fewer than 2 rows";
+  if (thinRequired.length) {
+    const thin = thinRequired;
     const err = new Error(
-      `${thin.length}/${tabEntries.length} tab(s) parsed to fewer than 2 rows, suggesting the section boundary is wrong: ` +
+      `${thin.length}/${requiredEntries.length} required tab(s) parsed to fewer than 2 rows, suggesting the section boundary is wrong: ` +
       thin.map(([, t]) => `"${t}"`).join(", ")
     );
     err.code = "thin_section";
@@ -1065,7 +1092,7 @@ async function loadLiveData() {
   const mcRaw = parsed.mustClose;
   const oppRaw = parsed.opportunities;
   const caseRaw = parsed.cases;
-  const rlRaw = parsed.revenue;
+  const rlRaw = revenueUnavailableReason ? [] : parsed.revenue;
   const nsRaw = parsed.nextSteps;
 
   const mcRows = rowsToObjects(mcRaw);
@@ -1073,5 +1100,5 @@ async function loadLiveData() {
   const caseRows = rowsToObjects(caseRaw);
   const rlRows = rlRaw; // raw 2D rows -- multi-row header, indexed access in buildDashboardData
   const nsRows = rowsToObjects(nsRaw);
-  return buildDashboardData(mcRows, oppRows, caseRows, rlRows, nsRows);
+  return buildDashboardData(mcRows, oppRows, caseRows, rlRows, nsRows, revenueUnavailableReason);
 }

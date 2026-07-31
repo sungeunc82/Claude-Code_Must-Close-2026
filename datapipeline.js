@@ -877,24 +877,71 @@ function locateByPosition(docText, name) {
   const lineEnd = docText.indexOf("\n", idx);
   return { idx, contentStart: lineEnd === -1 ? docText.length : lineEnd + 1 };
 }
+// The "Auto Refresh Execution Log" tab (an artifact of the Apps Script that refreshes
+// these tabs from Salesforce reports every few hours) writes a row per refresh that
+// repeats each *other* tab's name as a plain data value -- e.g. a row containing
+// "2026_mustclose_Assigned_RevOps" as its "Sheet" column. Since that log accumulates one
+// such row per refresh cycle, a given tab's name can appear dozens of times close
+// together purely as log data, which corrupts simple name-based positional search (each
+// match gets cut off by the very next log row mentioning a different target tab).
+// Column-header fingerprints sidestep this entirely: a header row's specific column-name
+// combination can't coincidentally appear as a single log data value.
+const TAB_FINGERPRINTS = {
+  "2026_mustclose_Assigned_RevOps": ["Campaign Name", "Ironclad Workflow"],
+  "Open Opportunities": ["Opportunity Name", "Y1 Expected Revenue"],
+  "KYC Case report_RevOps_Sung": ["Case Number", "Transition Notes"],
+};
+function locateByColumnFingerprint(docText, terms) {
+  if (!terms || !terms.length) return null;
+  const primary = terms[0];
+  let searchFrom = 0;
+  while (true) {
+    const idx = docText.indexOf(primary, searchFrom);
+    if (idx === -1) return null;
+    const window = docText.slice(idx, idx + 600);
+    if (terms.every(t => window.includes(t))) {
+      // Anchor on the START of the header line (not just past the matched terms), so
+      // this tab's own header row is included in ITS content, and the preceding tab's
+      // slice ends exactly here rather than mid-line into this header.
+      const lineStart = docText.lastIndexOf("\n", idx) + 1;
+      return { idx: lineStart, contentStart: lineStart };
+    }
+    searchFrom = idx + primary.length;
+  }
+}
+
 function locateTabSections(docText, wantedNames) {
   const headings = findAllHeadings(docText);
   const headingIndices = headings.map(h => h.index);
   const notFound = [];
+  const methods = {};
 
   // One unified, sorted marker list regardless of how each wanted tab was located,
   // so a heading-found tab's content still stops at a later positional-found tab
   // (and vice versa) rather than only ever stopping at another heading.
+  // Priority per tab: markdown heading > known column-header fingerprint > literal
+  // tab-name occurrence (least reliable -- see the fingerprint comment above).
   const markers = [];
   wantedNames.forEach(name => {
     const heading = headings.find(h => h.name.toLowerCase() === name.trim().toLowerCase());
     if (heading) {
       markers.push({ name, idx: heading.index, contentStart: heading.contentStart });
+      methods[name] = "heading";
+      return;
+    }
+    const fp = locateByColumnFingerprint(docText, TAB_FINGERPRINTS[name]);
+    if (fp) {
+      markers.push({ name, idx: fp.idx, contentStart: fp.contentStart });
+      methods[name] = "fingerprint";
       return;
     }
     const pos = locateByPosition(docText, name);
-    if (pos) markers.push({ name, idx: pos.idx, contentStart: pos.contentStart });
-    else notFound.push(name);
+    if (pos) {
+      markers.push({ name, idx: pos.idx, contentStart: pos.contentStart });
+      methods[name] = "name-position";
+      return;
+    }
+    notFound.push(name);
   });
 
   markers.sort((a, b) => a.idx - b.idx);
@@ -906,7 +953,7 @@ function locateTabSections(docText, wantedNames) {
     sections[marker.name] = docText.slice(marker.contentStart, end === Infinity ? docText.length : end);
   });
 
-  return { sections, notFound, headingsFoundCount: headings.length };
+  return { sections, notFound, headingsFoundCount: headings.length, methods };
 }
 
 async function loadLiveData() {
@@ -951,7 +998,7 @@ async function loadLiveData() {
   }
   const tabEntries = Object.entries(SHEET_TABS);
   const wantedNames = tabEntries.map(([, tabName]) => tabName);
-  const { sections, notFound, headingsFoundCount } = locateTabSections(docText, wantedNames);
+  const { sections, notFound, headingsFoundCount, methods } = locateTabSections(docText, wantedNames);
   if (notFound.length) {
     const err = new Error(
       `${notFound.length}/${tabEntries.length} expected tab(s) could not be located anywhere in the document read back from ${conn.server} / ${conn.tool}: ` +
@@ -962,6 +1009,7 @@ async function loadLiveData() {
     err.tool = conn.tool;
     err.missingTabs = notFound;
     err.sectionsFound = Object.keys(sections);
+    err.locationMethods = methods;
     err.headingsFoundCount = headingsFoundCount;
     err.docTextLength = docText.length;
     err.docTextPreview = docText.slice(0, 1500);
@@ -983,7 +1031,8 @@ async function loadLiveData() {
     err.code = "thin_section";
     err.server = conn.server;
     err.tool = conn.tool;
-    err.thinTabs = thin.map(([key, t]) => ({ tab: t, rowCount: parsed[key].length }));
+    err.thinTabs = thin.map(([key, t]) => ({ tab: t, rowCount: parsed[key].length, method: methods[t] }));
+    err.locationMethods = methods;
     err.sectionPreviews = thin.reduce((acc, [, t]) => {
       acc[t] = (sections[t] || "").slice(0, 800);
       return acc;

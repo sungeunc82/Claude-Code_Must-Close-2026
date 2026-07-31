@@ -1037,6 +1037,28 @@ async function loadLiveData() {
       acc[t] = (sections[t] || "").slice(0, 800);
       return acc;
     }, {});
+    // For tabs that fell back to the weakest method (raw name search, no fingerprint
+    // defined), show every occurrence of the name plus the document's tail -- enough
+    // to pinpoint where the real content actually sits without another guess.
+    err.occurrenceReports = thin
+      .filter(([, t]) => methods[t] === "name-position" || methods[t] === undefined)
+      .reduce((acc, [, t]) => {
+        const idxs = [];
+        let i = 0;
+        while (true) {
+          const idx = docText.indexOf(t, i);
+          if (idx === -1) break;
+          idxs.push(idx);
+          i = idx + Math.max(t.length, 1);
+        }
+        const sampleIdxs = idxs.length <= 4 ? idxs : [idxs[0], idxs[1], idxs[idxs.length - 2], idxs[idxs.length - 1]];
+        acc[t] = {
+          totalOccurrences: idxs.length,
+          samples: sampleIdxs.map(idx => docText.slice(Math.max(0, idx - 60), idx + t.length + 200).replace(/\n/g, "\\n")),
+        };
+        return acc;
+      }, {});
+    err.docTail = docText.slice(-2000);
     throw err;
   }
 

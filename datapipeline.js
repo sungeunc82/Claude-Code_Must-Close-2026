@@ -1100,5 +1100,24 @@ async function loadLiveData() {
   const caseRows = rowsToObjects(caseRaw);
   const rlRows = rlRaw; // raw 2D rows -- multi-row header, indexed access in buildDashboardData
   const nsRows = rowsToObjects(nsRaw);
-  return buildDashboardData(mcRows, oppRows, caseRows, rlRows, nsRows, revenueUnavailableReason);
+  const dashboardData = buildDashboardData(mcRows, oppRows, caseRows, rlRows, nsRows, revenueUnavailableReason);
+
+  // Visible even on a "successful" load: a thin_section/tab_not_found error only fires
+  // on total failure (<2 rows), which missed the real problem -- a tab can parse to a
+  // SMALL FRACTION of its real row count without ever tripping that check. Surface real
+  // counts + doc length always so under-capture is visible without another failure loop.
+  dashboardData._loadDiagnostics = {
+    docTextLength: docText.length,
+    docTail: docText.slice(-500),
+    locationMethods: methods,
+    rowCounts: {
+      mustClose: parsed.mustClose.length,
+      opportunities: parsed.opportunities.length,
+      cases: parsed.cases.length,
+      revenue: parsed.revenue ? parsed.revenue.length : 0,
+      nextSteps: parsed.nextSteps.length,
+    },
+    sectionCharLengths: Object.fromEntries(tabEntries.map(([, t]) => [t, (sections[t] || "").length])),
+  };
+  return dashboardData;
 }

@@ -788,15 +788,28 @@ function coercePayloadToRows(payload) {
   throw new Error("Unrecognized payload shape from the Sheets connector tool -- cannot parse into rows.");
 }
 
+// One attempt shape per call -- if the connector's real tool expects a different
+// parameter name, this throws and the caller attaches full context (server, tool,
+// args sent, underlying message/result) so the on-page error banner can show exactly
+// what to fix, rather than a bare "upstream_error".
 async function fetchSheetTab(conn, tabName) {
   const range = `'${tabName}'!A1:ZZ20000`;
-  const result = await window.claude.mcp.callTool(
-    conn.server,
-    conn.tool,
-    { spreadsheetId: SPREADSHEET_ID, fileId: SPREADSHEET_ID, range, sheetName: tabName },
-    { cache: { refresh: true } }
-  );
-  return coercePayloadToRows(result.payload);
+  const args = { spreadsheetId: SPREADSHEET_ID, fileId: SPREADSHEET_ID, range, sheetName: tabName };
+  try {
+    const result = await window.claude.mcp.callTool(conn.server, conn.tool, args, { cache: { refresh: true } });
+    return coercePayloadToRows(result.payload);
+  } catch (e) {
+    const err = new Error(`Reading tab "${tabName}" via ${conn.server} / ${conn.tool} failed: ${(e && e.message) || e}`);
+    err.code = (e && e.code) || "unknown";
+    err.server = (e && e.server) || conn.server;
+    err.tool = conn.tool;
+    err.tab = tabName;
+    err.attemptedArgs = args;
+    err.originalMessage = e && e.message;
+    err.retryable = e && e.retryable;
+    err.result = e && e.result;
+    throw err;
+  }
 }
 
 async function loadLiveData() {
@@ -812,13 +825,29 @@ async function loadLiveData() {
     err.availableServers = conn.availableServers;
     throw err;
   }
-  const [mcRaw, oppRaw, caseRaw, rlRaw, nsRaw] = await Promise.all([
-    fetchSheetTab(conn, SHEET_TABS.mustClose),
-    fetchSheetTab(conn, SHEET_TABS.opportunities),
-    fetchSheetTab(conn, SHEET_TABS.cases),
-    fetchSheetTab(conn, SHEET_TABS.revenue),
-    fetchSheetTab(conn, SHEET_TABS.nextSteps),
-  ]);
+  const tabEntries = Object.entries(SHEET_TABS);
+  const settled = await Promise.allSettled(tabEntries.map(([, tabName]) => fetchSheetTab(conn, tabName)));
+  const failed = settled
+    .map((s, i) => ({ s, tab: tabEntries[i][1] }))
+    .filter(x => x.s.status === "rejected");
+  if (failed.length) {
+    const first = failed[0].s.reason;
+    const err = new Error(
+      `Failed to read ${failed.length}/${tabEntries.length} tab(s) via ${conn.server} / ${conn.tool}. ` +
+      `First failure (tab "${failed[0].tab}"): ${(first && first.message) || first}`
+    );
+    err.code = (first && first.code) || "upstream_error";
+    err.server = conn.server;
+    err.tool = conn.tool;
+    err.allTools = conn.allTools;
+    err.failedTabs = failed.map(f => f.tab);
+    err.attemptedArgs = first && first.attemptedArgs;
+    err.originalMessage = first && first.originalMessage;
+    err.retryable = first && first.retryable;
+    err.result = first && first.result;
+    throw err;
+  }
+  const [mcRaw, oppRaw, caseRaw, rlRaw, nsRaw] = settled.map(s => s.value);
   const mcRows = rowsToObjects(mcRaw);
   const oppRows = rowsToObjects(oppRaw);
   const caseRows = rowsToObjects(caseRaw);

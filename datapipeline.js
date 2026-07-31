@@ -762,7 +762,9 @@ async function discoverSheetsConnector() {
 }
 
 // read_file_content's payload has been observed as a plain string (the natural-language
-// doc). Handle a couple of plausible wrapper shapes defensively too.
+// doc). Handle a couple of plausible wrapper shapes defensively too. If none match, throw
+// with enough shape detail (type, keys, a truncated dump) to fix this on the next pass
+// without having to guess again.
 function extractDocText(payload) {
   if (typeof payload === "string") return payload;
   if (payload && typeof payload === "object") {
@@ -771,9 +773,23 @@ function extractDocText(payload) {
     if (Array.isArray(payload.content)) {
       const textBlock = payload.content.find(b => b && b.type === "text" && typeof b.text === "string");
       if (textBlock) return textBlock.text;
+      // No text-typed block matched -- try the first block with ANY string field, or
+      // fall back to describing the block shapes actually present.
+      for (const b of payload.content) {
+        if (b && typeof b === "object") {
+          const strField = Object.keys(b).find(k => typeof b[k] === "string" && k !== "type");
+          if (strField) return b[strField];
+        }
+      }
     }
   }
-  throw new Error("read_file_content returned a payload shape with no recognizable text content.");
+  const err = new Error("read_file_content returned a payload shape with no recognizable text content.");
+  err.payloadType = Array.isArray(payload) ? "array" : typeof payload;
+  err.payloadKeys = (payload && typeof payload === "object") ? Object.keys(payload) : undefined;
+  err.payloadPreview = (() => {
+    try { return JSON.stringify(payload).slice(0, 1500); } catch (e2) { return String(payload).slice(0, 1500); }
+  })();
+  throw err;
 }
 
 // A real CSV parser (quoted fields, "" escaping, embedded commas/newlines inside quotes) --
@@ -858,7 +874,15 @@ async function loadLiveData() {
     throw err;
   }
 
-  const docText = extractDocText(result.payload);
+  let docText;
+  try {
+    docText = extractDocText(result.payload);
+  } catch (e) {
+    e.server = conn.server;
+    e.tool = conn.tool;
+    e.code = "unrecognized_payload";
+    throw e;
+  }
   const sections = parseWholeDocIntoTabs(docText);
   const tabEntries = Object.entries(SHEET_TABS);
   const missing = tabEntries.filter(([, tabName]) => findTabSection(sections, tabName) === undefined);
